@@ -265,42 +265,47 @@ C: while(my $cmd=shift(@chat)) {
     } elsif($cmd =~ /^e ([0-9]+) (.*)$/) {
       my $timeout=$1*1000;
       my $exp=$2;
-      my $lastline=undef;
+      my $lastline="";
       my @events;
       while($ssh2->poll($timeout, \@poll, \@events)) {
-        $lastline=<$ch>;
-        if(!defined($lastline)) {
-          $log .= "undefined input\nLast command: $lastcmd\n";
+        my $read_buff="";
+        my $bytes_read=$ch->read($read_buff,1);
+        if(!defined($bytes_read)) {
+          $log .= "undefined read\nLast command: $lastcmd\n";
           $ch->close();
-          push(@err, "ERROR: undefined input");
+          push(@err, "ERROR: undefined read");
           push(@err, "ERROR: Last command: $lastcmd");
           goto FINISH;
         };
         if($opt_d) {
-          hexdump($lastline);
+          hexdump($read_buff);
         };
-        #$lastline =~ s/\r//g;
-        $lastline =~ s/^.*\x0D//g;
-        chomp $lastline;
-        if($opt_d) {
-          print("After process:\n");
-          hexdump($lastline);
-          print("\n");
+        $read_buff =~ s/^\x0D//g;
+        $lastline .= $read_buff;
+        if($read_buff eq "\n") {
+          $log .= "Answer line: $lastline";
+          $lastline = "";
         };
-        $log .= "Answer: $lastline\n";
+        #if($opt_d) {
+        #  print("After process:\n");
+        #  hexdump($lastline);
+        #  print("\n");
+        #};
 
         if($opt_d) {
           print("Match: \"$lastline\" vs \"/$exp\$/\"\n");
         };
         if($lastline =~ /$exp$/) {
+          $log .= "Answer matched: $lastline\n";
           next C;
         };
         if(defined($pager_regex) && $lastline =~ /$pager_regex/) {
+          $log .= "Paging matched: $lastline\n";
           $log .= "Paging\n";
           print($ch "$pager_cmd");
         };
       };
-      if(!defined($lastline)) {
+      if($lastline eq "") {
         $log .= "expect timeout\nLast command: $lastcmd\n";
         my ($err_code, $err_name, $err_str)=$ssh2->error();
         $log .= "error code $err_code, name $err_name, string $err_str\n";
