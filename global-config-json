@@ -465,7 +465,7 @@ foreach my $dev_id (keys(%{$data})) {
       } else {
         $pids{$frk}{ip} = $$data{$dev_id}{data_ip};
         $pids{$frk}{sn} = $$data{$dev_id}{short_name};
-        $pids{$frk}{id} = $$data{$dev_id}{id};
+        #$pids{$frk}{id} = $$data{$dev_id}{id};
       };
     };
   } else {

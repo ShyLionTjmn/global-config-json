@@ -39,12 +39,14 @@ Example data JSON:
   "r1": {
     "short_name": "router1",
     "overall_status": "ok",
-    "sysObjectID": ".1.3.6.1.4.1.40418.7.5"
+    "sysObjectID": ".1.3.6.1.4.1.40418.7.5",
+    "data_ip": "1.2.3.4"
   },
   "r2": {
     "short_name": "router2",
     "overall_status": "ok",
-    "sysObjectID": ".1.3.6.1.4.1.1.2.3"
+    "sysObjectID": ".1.3.6.1.4.1.1.2.3",
+    "data_ip": "1.2.3.5"
   }
 }
 ==================
@@ -89,3 +91,7 @@ Mikrotik specific
 Use username+cte as login, to disable color injections into output
 Use -r parameter to send \r instead \n newline, otherwise it will not accept commands.
 
+==============
+JSON
+==============
+data_ip and short_name are mandatory fields
