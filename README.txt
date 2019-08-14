@@ -88,7 +88,7 @@ This example script will skip all devices with error overall status, and process
 Mikrotik specific
 ==============
 
-Use username+cte as login, to disable color injections into output
+Use username+ct as login, to disable color injections into output
 Use -r parameter to send \r instead \n newline, otherwise it will not accept commands.
 
 ==============
