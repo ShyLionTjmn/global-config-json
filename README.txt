@@ -80,3 +80,12 @@ d
 ==============
 
 This example script will skip all devices with error overall status, and process only those, matching sysObjectID .1.3.6.1.4.1.40418.7.5
+
+
+==============
+Mikrotik specific
+==============
+
+Use username+cte as login, to disable color injections into output
+Use -r parameter to send \r instead \n newline, otherwise it will not accept commands.
+
