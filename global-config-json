@@ -1,0 +1,496 @@
+#!/usr/bin/perl -w
+
+use strict;
+use integer;
+use utf8;
+use JSON qw( from_json to_json decode_json encode_json);
+use Data::Dumper;
+use Fcntl qw(:flock LOCK_EX SEEK_SET);
+use Try::Tiny;
+use Net::Netmask;
+use Time::HiRes;
+use Net::SSH2;
+use Term::ReadKey;
+
+
+$Data::Dumper::Indent = 1;
+$Data::Dumper::Sortkeys = 1;
+
+use v5.16;
+
+sub hexdump($)
+{
+    my $offset = 0;
+        
+    foreach my $chunk (unpack "(a16)*", $_[0])
+    {
+        my $hex = unpack "H*", $chunk; # hexadecimal magic
+        $chunk =~ tr/ -~/./c;          # replace unprintables
+        $hex   =~ s/(.{1,8})/$1 /gs;   # insert spaces
+        printf "0x%08x (%05u)  %-*s %s\n",
+            $offset, $offset, 36, $hex, $chunk;
+        $offset += 16;
+    }
+};
+
+my $opt_v=0;
+my $opt_l=0;
+my $opt_f=0;
+my $opt_d=0;
+my $opt_r="\n";
+my @opt_a;
+my $data_file="/etc/global-config-json.json";
+
+my $pause_file_template="/var/mymapper/pause.{IP}";
+
+my $usage="Usage: $0 [-j json_data_file] [-f] [-v] [-l] [-a arg0 [-a arg1 [ ... -a arg9 ] ] script_file [ip/name/id ...]\
+\t-f\tdo not fork, will slow work one by one\
+\t-v\tverbose\
+\t-d\tdebug\
+\t-r\tuse \\r instead \\n\
+\t-l\tsave full log in any case\
+\t-a argX\targument %X (0-9) to be replaced wuth argX\
+\tscript_file:\
+\tmatch data_key regexp\
+\tnotch data_key regexp\
+\
+\tuser username, or will be asked for, once\
+\tpass password\
+\
+\tl\tlogin\
+\te NN regex\texpect for NN seconds\
+\tp command\tprint command\
+\td\tdisconnect\
+\
+\tif ip/name/id set, only these devices will procceed (script filter will apply anyway)\
+";
+
+while(scalar(@ARGV) && $ARGV[0] =~ /^-/) {
+  if($ARGV[0] eq '-v') {
+    $opt_v=1;
+  } elsif($ARGV[0] eq '-f') {
+    $opt_f=1;
+  } elsif($ARGV[0] eq '-r') {
+    $opt_r="\r";
+  } elsif($ARGV[0] eq '-d') {
+    $opt_d=1;
+  } elsif($ARGV[0] eq '-j') {
+    shift(@ARGV);
+    if(scalar(@ARGV) == 0) {
+      print(STDERR "No arg after -a\n");
+      print(STDERR $usage);
+      exit 1;
+    };
+    $data_file=$ARGV[0];
+  } elsif($ARGV[0] eq '-l') {
+    $opt_l=1;
+  } elsif($ARGV[0] eq '-a') {
+    shift(@ARGV);
+    if(scalar(@ARGV) == 0) {
+      print(STDERR "No arg after -a\n");
+      print(STDERR $usage);
+      exit 1;
+    };
+    if(scalar(@opt_a) == 10) {
+      print(STDERR "Too many -a\n");
+      print(STDERR $usage);
+      exit 1;
+    };
+    push(@opt_a, $ARGV[0]);
+  } else {
+    print(STDERR "Unknown option ".$ARGV[0]."\n");
+    print(STDERR $usage);
+    exit 1;
+  };
+  shift(@ARGV);
+};
+
+if(scalar(@ARGV) == 0) {
+  print(STDERR "No script specified\n");
+  print(STDERR $usage);
+  exit 1;
+};
+
+my $script_file_name=shift(@ARGV);
+my $sf;
+
+open($sf, "<", $script_file_name) or die "Cannot open file $script_file_name";
+
+our $chat_script="";
+my @match;
+
+my $user;
+my $pass;
+
+my $pager_regex;
+my $pager_cmd=" ";
+
+while(<$sf>) {
+  s/\n//;
+  if(/^((?:no)?match)\s+([^\s]+)\s(.*)$/) {
+    push(@match, [$1,$2,$3]);
+  } elsif(/^user\s+([^\s]+)$/) {
+    $user=$1;
+  } elsif(/^pass\s(.*)$/) {
+    $pass=$1;
+  } elsif(/^pager_reg\s(.*)$/) {
+    $pager_regex=$1;
+  } elsif(/^pager_cmd\s(.*)$/) {
+    $pager_cmd=$1;
+  } elsif(/^#/ || /^\s*$/) {
+    #comment or empty string
+  } else {
+    $chat_script .= $_."\n";
+  };
+};
+    
+close($sf);
+
+my $t=time();
+
+my $full_log="/var/log/global-config-json.fulllog.$t";
+my $errors="/var/log/global-config-json.errors.$t";
+
+$|=1;
+
+if(!defined($user) || !defined($pass)) {
+  print("Enter user name\n");
+  $user=Term::ReadKey::ReadLine(0);
+  $user =~ s/\n//g;
+  print("Enter password for '$user'\n");
+  Term::ReadKey::ReadMode(2);
+  $pass=Term::ReadKey::ReadLine(0);
+  Term::ReadKey::ReadMode(0);
+  $pass =~ s/\n//g;
+};
+
+#print(Dumper(@match));
+#print("Script:\n================\n$chat_script\n======\n");
+
+sub work_router {
+  my $log="";
+  my @err;
+  my $ip=shift;
+  my $hostname=shift;
+
+  $0="global_config $ip $hostname";
+
+#  if($opt_v) {
+    print("Working $ip $hostname\n");
+#  };
+  $log .= "Working $ip $hostname\n";
+  $hostname =~ s/\..*$//;
+  if($hostname eq "") {
+    $log .= "ERROR: Empty hostname for $ip\n";
+    push(@err, "Empty hostname");
+    goto FINISH;
+  };
+  my @lt=localtime();
+  my $Y=sprintf("%04u", $lt[5]+1900);
+  my $M=sprintf("%02u", $lt[4]+1);
+  my $D=sprintf("%02u", $lt[3]);
+  my $h=sprintf("%02u", $lt[2]);
+  my $min=sprintf("%02u", $lt[1]);
+  my $s=sprintf("%02u", $lt[0]);
+  my $t=time();
+
+  my @chat=map { s/%n/$hostname/g; s/%Y/$Y/g; s/%M/$M/g; s/%D/$D/g; s/%h/$h/g; s/%m/$min/g; s/%s/$s/g; s/%t/$t/g; $_ } grep { $_ ne "" } split(/\n/, $chat_script);
+  for(my $i=0; $i < scalar(@opt_a); $i++) {
+    @chat=map { s/%$i/$opt_a[$i]/g; $_} @chat;
+  };
+  my $ssh2;
+  my $ch;
+  my @poll;
+  my $paused=0;
+
+  my $pause_file_name=$pause_file_template;
+  my $paused_file_name=$paused_file_template;
+  $pause_file_name =~ s/\{IP\}/$ip/g;
+  $paused_file_name =~ s/\{IP\}/$ip/g;
+
+C: while(my $cmd=shift(@chat)) {
+    my $lastcmd=$cmd;
+    if($cmd =~ /^z ([0-9]+)$/) {
+      my $timer=$1;
+      $log .= "Pausing: ";
+      if(! -f $pause_file_name) {
+        my $pause_file;
+        if(!open($pause_file, ">>", $pause_file_name)) {
+          $log .= "Pausing file error: file: \"$pause_file_name\"\n";
+          push(@err, "Pausing file error: file: \"$pause_file_name\"");
+          goto FINISH;
+        };
+        close($pause_file);
+        $paused=1;
+        $log .= "file created\n";
+      } else {
+        $log .= "paused before us\n";
+      };
+      $log .= "Waiting for pause, max $timer sec\n";
+      my $waited=0;
+      while(! -f $paused_file_name) {
+        if($timer == 0) {
+          $log .= "Pausing error\n";
+          push(@err, "Pausing file error");
+          goto FINISH;
+        };
+        sleep(1);
+        $waited++;
+        $timer--;
+      };
+      $log .= "Done waiting for pause, spent $waited sec\n";
+    } elsif($cmd =~ /^l/) {
+      $ssh2=Net::SSH2->new();
+      $ssh2->timeout(30000);
+      $log .= "\n";
+      $log .= "Connecting $ip\n";
+      if(!$ssh2->connect($ip)) {
+        $log .= "Error connecting $ip\n";
+        push(@err, "Connecting error");
+        goto FINISH;
+      };
+      $log .= "Authorizing\n";
+      if(!$ssh2->auth_password($user,$pass)) {
+        $log .= "Auth error\n";
+        push(@err, "Auth error");
+        goto FINISH;
+      };
+      $ch=$ssh2->channel();
+      $ch->blocking(0);
+      @poll={ handle => $ch, events => ['in']};
+      $log .= "Starting shell\n";
+      $ch->pty(0);
+      $ch->shell();
+    } elsif($cmd =~ /^e ([0-9]+) (.*)$/) {
+      my $timeout=$1*1000;
+      my $exp=$2;
+      my $lastline=undef;
+      my @events;
+      while($ssh2->poll($timeout, \@poll, \@events)) {
+        $lastline=<$ch>;
+        if(!defined($lastline)) {
+          $log .= "undefined input\nLast command: $lastcmd\n";
+          $ch->close();
+          push(@err, "ERROR: undefined input");
+          push(@err, "ERROR: Last command: $lastcmd");
+          goto FINISH;
+        };
+        if($opt_d) {
+          hexdump($lastline);
+        };
+        #$lastline =~ s/\r//g;
+        $lastline =~ s/^.*\x0D//g;
+        chomp $lastline;
+        if($opt_d) {
+          print("After process:\n");
+          hexdump($lastline);
+          print("\n");
+        };
+        $log .= "Answer: $lastline\n";
+
+        if($opt_d) {
+          print("Match: \"$lastline\" vs \"/$exp\$/\"\n");
+        };
+        if($lastline =~ /$exp$/) {
+          next C;
+        };
+        if(defined($pager_regex) && $lastline =~ /$pager_regex/) {
+          $log .= "Paging\n";
+          print($ch "$pager_cmd");
+        };
+      };
+      if(!defined($lastline)) {
+        $log .= "expect timeout\nLast command: $lastcmd\n";
+        my ($err_code, $err_name, $err_str)=$ssh2->error();
+        $log .= "error code $err_code, name $err_name, string $err_str\n";
+        $ch->close();
+        push(@err, "ERROR: expect timeout");
+        push(@err, "ERROR: Last command: $lastcmd");
+        goto FINISH;
+      };
+      if($lastline ne $exp) {
+if($opt_d) {
+  print("No match, expected: \"$exp\"\n");
+  print("lastline: \"$lastline\"\n");
+  print("Last command: $lastcmd\n");
+};
+        $log .= "No match, expected: $exp\n";
+        $log .= "lastline: \"$lastline\"\n";
+        $log .= "Last command: $lastcmd\n";
+        $ch->close();
+        push(@err, "ERROR: No match, expected: $exp");
+        push(@err, "ERROR: Last command: $lastcmd");
+        goto FINISH;
+      };
+    } elsif($cmd =~ /^p (.*)$/) {
+if($opt_d) {
+  print("Issuing command: \"$1\"\n");
+};
+      $log .= "Issuing command: $1\n";
+      print($ch "$1".$opt_r);
+    } elsif($cmd =~ /^d/) {
+      $log .= "Disconnecting\n";
+    };
+  };
+FINISH:
+  if($paused) {
+    unlink($pause_file_name);
+  };
+  $log .= "\n\n";
+  if(defined($ch)) {
+    $ch->close;
+  };
+  if($opt_v || $opt_l) {
+    if(open(my $logf, '>>', $full_log)) {
+      if(flock($logf, LOCK_EX)) {
+        print $logf $log;
+        flock($logf, LOCK_UN);
+      } else {
+        push(@err, "ERROR: cannot lock log file");
+      };
+      close($logf);
+    } else {
+      push(@err, "ERROR: cannot open log file");
+    };
+  };
+  if(scalar(@err) > 0) {
+    if(open(my $errf, '>>', $errors)) {
+      if(flock($errf, LOCK_EX)) {
+        foreach my $e (@err) {
+          print($errf "$ip $hostname $e\n");
+        };
+        flock($errf, LOCK_UN);
+      } else {
+        print(STDERR "$ip $hostname Error locking error file\n");
+      };
+      close($errf);
+    } else {
+      print(STDERR "$ip $hostname Error opening error file\n");
+    };
+    return 0;
+  } else {
+    return 1;
+  };
+};
+
+
+
+my $fh;
+
+if(!open($fh, "<", $data_file)) {
+  die "Cannot open $data_file";
+};
+
+if(!flock($fh, LOCK_SH)) {
+  close $fh;
+  die "Cannot lock $data_file";
+};
+
+my $json="";
+while(<$fh>) {
+  $json .= $_;
+};
+close($fh);
+
+my $data;
+try {
+  $data=from_json($json, { utf8  => 1 });
+} catch {
+  die "Error parsing JSON file $data_file";
+};
+
+my %pids;
+
+my $successes=0;
+my $failures=0;
+
+DEV_LOOP:
+foreach my $dev_id (keys(%{$data})) {
+  if($dev_id eq 'data') {
+    next;
+  };
+  if(scalar(@ARGV)) {
+    if(!scalar(grep { $$data{$dev_id}{data_ip} eq $_ || $$data{$dev_id}{short_name} eq $_ || $dev_id eq $_ } @ARGV)) {
+      if($opt_v) {
+        print("Device skipped by command line: ".$$data{$dev_id}{data_ip}." ".$$data{$dev_id}{short_name}." $dev_id\n");
+      };
+      next;
+    };
+  };
+
+  if(scalar(@match)) {
+    foreach my $m (@match) {
+      my $op=$$m[0];
+      if($op eq "match" || $op eq "nomatch") {
+        my $key=$$m[1];
+        my $regex=$$m[2];
+        if(!defined($$data{$dev_id}{$key})) {
+          if($opt_v) { print(STDERR "Device $dev_id has no key \"$key\", skipping it\n"); };
+          next DEV_LOOP;
+        };
+        if($op eq "match" && $$data{$dev_id}{$key} !~ /$regex/) {
+          if($opt_v) {
+            print("Device not matched: ".$$data{$dev_id}{short_name}." key $key\n");
+          };
+          next DEV_LOOP;
+        } elsif($op eq "nomatch" && $$data{$dev_id}{$key} =~ /$regex/) {
+          if($opt_v) {
+            print("Device nomatched: ".$$data{$dev_id}{short_name}." key $key\n");
+          };
+          next DEV_LOOP;
+        };
+      } else {
+        die "unknown op $op";
+      };
+    };
+  };
+
+  if($opt_v) {
+    print("Device matched: ".$$data{$dev_id}{short_name}."\n");
+  };
+
+  if(!$opt_f) {
+    my $frk=fork();
+    if(!defined($frk)) {
+      die("Fork error!\n");
+    } else {
+      if($frk == 0) {
+        exit work_router($$data{$dev_id}{data_ip}, $$data{$dev_id}{short_name});
+      } else {
+        $pids{$frk}{ip} = $$data{$dev_id}{data_ip};
+        $pids{$frk}{sn} = $$data{$dev_id}{short_name};
+        $pids{$frk}{id} = $$data{$dev_id}{id};
+      };
+    };
+  } else {
+    if(work_router($$data{$dev_id}{data_ip}, $$data{$dev_id}{short_name})) {
+      $successes++;
+    } else {
+      $failures++;
+      print(STDERR $$data{$dev_id}{data_ip}." ".$$data{$dev_id}{short_name}." Failed\n");
+    };
+  };
+};
+
+if($opt_v && !$opt_f) {
+  sleep(1);
+  print("Waiting for children\n");
+};
+
+if(!$opt_f) {
+  my $wpid;
+  while(($wpid = wait()) != -1) {
+    if($?) {
+      $successes++;
+    } else {
+      $failures++;
+      print(STDERR $pids{$wpid}{ip}." ".$pids{$wpid}{sn}." Failed\n");
+    };
+  };
+};
+
+if($opt_v) { print("Successed: $successes, Failures: $failures\n"); };
+
+if($failures) { print(STDERR "Error log: $errors\n"); };
+if($opt_v || $opt_l) { print("Full log: $full_log\n"); };
+
