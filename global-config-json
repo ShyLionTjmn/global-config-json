@@ -42,6 +42,7 @@ my @opt_a;
 my $data_file="/etc/global-config-json.json";
 
 my $pause_file_template="/var/mymapper/pause.{IP}";
+my $paused_file_template="/var/mymapper/paused.{IP}";
 
 my $usage="Usage: $0 [-j json_data_file] [-f] [-v] [-l] [-a arg0 [-a arg1 [ ... -a arg9 ] ] script_file [ip/name/id ...]\
 \t-f\tdo not fork, will slow work one by one\
